@@ -1,174 +1,309 @@
-# main.py
-#
-# A fully functional AI agent with Nmap and Aircrack-ng integration.
-# WARNING: For authorized and ethical use only. Read the setup guide.
-#
-# SETUP:
-# 1. Install Ollama: https://ollama.com/
-# 2. Install System Tools: `sudo apt-get install -y nmap aircrack-ng` (or equivalent)
-# 3. Pull the model: `ollama pull whiterabbitneo/whiterabbitneo-33b`
-# 4. Install Python libs: `pip install langchain langchain-community duckduckgo-search`
-
-import os
+import sys
 import subprocess
-import time
-import platform
-import shlex
-from langchain_community.llms import Ollama
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.tools import Tool
-from langchain import hub
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
+import requests
+import re
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QLineEdit, QTextEdit, QAction, QDialog, 
+                             QFormLayout, QPushButton, QFileDialog)
+from PyQt5.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
+from pymetasploit3.msfrpc import MsfRpcClient
 
-# --- Tool Implementations ---
+# --- Configuration ---
+# These can be updated via the settings dialog
+class AppConfig:
+    def __init__(self):
+        self.llm_api_url = "http://127.0.0.1:5000/v1/chat/completions"
+        self.msf_user = "msf"
+        self.msf_password = "msf_password" # Default password
+        self.msf_host = "127.0.0.1"
+        self.msf_port = 55553
+        self.nmap_path = "nmap"
 
-def run_command(command: str) -> str:
+config = AppConfig()
+
+# --- Settings Dialog ---
+class SettingsDialog(QDialog):
+    """A dialog to configure application settings."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        layout = QFormLayout(self)
+
+        self.llm_url_edit = QLineEdit(config.llm_api_url)
+        self.msf_user_edit = QLineEdit(config.msf_user)
+        self.msf_pass_edit = QLineEdit(config.msf_password)
+        self.msf_pass_edit.setEchoMode(QLineEdit.Password)
+        
+        nmap_button = QPushButton("Browse...")
+        nmap_button.clicked.connect(self.browse_nmap)
+        self.nmap_path_edit = QLineEdit(config.nmap_path)
+
+        layout.addRow("LLM API URL:", self.llm_url_edit)
+        layout.addRow("Metasploit User:", self.msf_user_edit)
+        layout.addRow("Metasploit Password:", self.msf_pass_edit)
+        layout.addRow("Nmap Path:", self.nmap_path_edit)
+        layout.addRow(nmap_button)
+
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self.save_settings)
+        layout.addWidget(save_button)
+
+    def browse_nmap(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Nmap Executable")
+        if path:
+            self.nmap_path_edit.setText(path)
+
+    def save_settings(self):
+        config.llm_api_url = self.llm_url_edit.text()
+        config.msf_user = self.msf_user_edit.text()
+        config.msf_password = self.msf_pass_edit.text()
+        config.nmap_path = self.nmap_path_edit.text()
+        self.accept()
+
+# --- Worker Thread ---
+class Worker(QObject):
     """
-    A helper function to securely run shell commands and return their output.
-    Uses shlex.split to prevent shell injection vulnerabilities.
+    Worker thread for handling long-running tasks.
     """
-    try:
-        print(f"\n--- Running Command: '{command}' ---")
-        # Use shlex.split to handle command-line arguments safely.
-        args = shlex.split(command)
-        # Check if the command requires sudo.
-        if "sudo" not in args[0] and os.geteuid() != 0:
-             # Certain commands like airodump-ng need root privileges.
-             # We can check for specific commands if needed.
-             if any(cmd in args for cmd in ["airodump-ng", "aireplay-ng"]):
-                 print("INFO: This command may require root privileges. Prepending 'sudo'.")
-                 args.insert(0, "sudo")
+    finished = pyqtSignal()
+    output = pyqtSignal(str)
+    error = pyqtSignal(str)
 
-        process = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            check=False, # Set to False to handle non-zero exit codes manually.
-            timeout=300  # 5-minute timeout for long scans.
-        )
-        if process.returncode != 0:
-            # Return both stdout and stderr for better debugging by the agent.
-            return f"Error executing command. Return Code: {process.returncode}\nSTDOUT:\n{process.stdout}\nSTDERR:\n{process.stderr}"
-        return process.stdout
-    except FileNotFoundError:
-        return f"Error: The command '{shlex.split(command)[0]}' was not found. Is it installed and in your PATH?"
-    except subprocess.TimeoutExpired:
-        return "Error: The command took too long to execute and was timed out."
-    except Exception as e:
-        return f"An unexpected error occurred: {e}"
+    def __init__(self, command):
+        super().__init__()
+        self.command = command
+        self.msf_client = None
 
-def nmap_scan(target_and_args: str) -> str:
-    """
-    Runs an Nmap scan with the given arguments against a target.
-    Example: 'nmap -sV -p 1-1000 192.168.1.1'
-    For security, only allows commands that start with 'nmap'.
-    """
-    if not target_and_args.strip().startswith("nmap "):
-        return "Invalid input. The command must start with 'nmap '."
-    return run_command(target_and_args)
-
-def aircrack_scan(args: str) -> str:
-    """
-    Runs an Aircrack-ng suite command (e.g., airodump-ng, aireplay-ng).
-    Example: 'airodump-ng wlan0mon'
-    For security, only allows commands starting with 'airodump-ng', 'aireplay-ng', or 'aircrack-ng'.
-    """
-    command_parts = args.strip().split()
-    if not command_parts or command_parts[0] not in ["airodump-ng", "aireplay-ng", "aircrack-ng"]:
-        return "Invalid input. Command must start with 'airodump-ng', 'aireplay-ng', or 'aircrack-ng'."
-    return run_command(args)
-
-def internet_search(query: str) -> str:
-    """Performs an internet search using DuckDuckGo."""
-    print(f"\n--- Performing Internet Search for: '{query}' ---")
-    try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=5)]
-            return "\n".join([f"Title: {res['title']}\nSnippet: {res['body']}\nURL: {res['href']}\n"]) if results else "No results found."
-    except Exception as e:
-        return f"An error occurred during web search: {e}"
-
-def self_enhancement_tool_func(llm: Ollama) -> callable:
-    """Creates the self-enhancement tool."""
-    enhancement_prompt = PromptTemplate(
-        input_variables=["user_objective"],
-        template="You are a meta-cognitive AI. Improve the following objective: '{user_objective}'"
-    )
-    enhancement_chain = LLMChain(llm=llm, prompt=enhancement_prompt)
-    def run_enhancement(user_objective: str) -> str:
-        print(f"\n--- Engaging Self-Enhancement for: '{user_objective}' ---")
+    def connect_msf(self):
+        """Initializes connection to Metasploit RPC server."""
         try:
-            return enhancement_chain.invoke({"user_objective": user_objective}).get('text', 'Failed to get enhancement response.')
+            self.msf_client = MsfRpcClient(config.msf_password, user=config.msf_user, 
+                                           server=config.msf_host, port=config.msf_port, ssl=False)
+            self.output.emit("[INFO] Connected to Metasploit RPC server.\n")
+            return True
         except Exception as e:
-            return f"An error occurred during self-enhancement: {e}"
-    return run_enhancement
+            self.error.emit(f"[ERROR] Failed to connect to Metasploit RPC: {e}\n"
+                            f"Ensure msfrpcd is running with the correct credentials.\n"
+                            f"Start it with: msfrpcd -P {config.msf_password} -U {config.msf_user} -a {config.msf_host}\n")
+            return False
 
-# --- Main Agent Class ---
-
-class EnhancedAIAgent:
-    """The main class for our AI agent."""
-    def __init__(self, model_name="whiterabbitneo/whiterabbitneo-33b"):
-        print("Initializing the Enhanced AI Agent...")
-        self.agent_executor = None
-        if os.geteuid() != 0:
-            print("\nWARNING: You are not running this script as root.")
-            print("Nmap and Aircrack-ng tools may require sudo privileges to function correctly.\n")
-
+    @pyqtSlot()
+    def run(self):
         try:
-            self.llm = Ollama(model=model_name, temperature=0.1)
-            self.llm.invoke("Hello?", stop=["?"])
-            print("Successfully connected to Ollama model.")
-        except Exception:
-            print("Could not connect to Ollama. Attempting to start the server...")
-            try:
-                # Simplified server start logic for brevity
-                subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(5)
-                self.llm = Ollama(model=model_name, temperature=0.1)
-                self.llm.invoke("Hello?", stop=["?"])
-                print("Successfully started and connected to Ollama model.")
-            except Exception as e:
-                print(f"\nFATAL ERROR: Failed to start or connect to Ollama. Please start it manually. Details: {e}")
-                return
+            cmd_lower = self.command.strip().lower()
+            if cmd_lower.startswith("nmap "):
+                self.run_nmap_command(self.command)
+            elif cmd_lower.startswith("msf "):
+                self.run_metasploit_command(self.command)
+            else:
+                self.query_llm(self.command)
+        except Exception as e:
+            self.error.emit(f"An unexpected error occurred in worker: {str(e)}\n")
+        finally:
+            self.finished.emit()
 
-        self.tools = [
-            Tool(name="InternetSearch", func=internet_search, description="Searches the internet for information. Input is a search query."),
-            Tool(name="SelfEnhancement", func=self_enhancement_tool_func(self.llm), description="Analyzes and improves a complex plan or prompt. Input is the objective to enhance."),
-            Tool(name="NmapScan", func=nmap_scan, description="Executes an Nmap scan to discover hosts, ports, and services on a network. Input must be a valid Nmap command string (e.g., 'nmap -sV 192.168.1.1')."),
-            Tool(name="AircrackScan", func=aircrack_scan, description="Executes a command from the Aircrack-ng suite for WiFi security analysis. Input must be a valid command string (e.g., 'airodump-ng wlan0mon').")
-        ]
-        prompt = hub.pull("hwchase17/react")
-        agent = create_react_agent(self.llm, self.tools, prompt)
-        self.agent_executor = AgentExecutor(agent=agent, tools=self.tools, verbose=True, handle_parsing_errors=True)
-        print("Agent initialized successfully.")
+    def query_llm(self, prompt):
+        self.output.emit(f"[INFO] Querying LLM with: {prompt}\n")
+        try:
+            payload = {
+                "model": "whiterabbitneo-33b", # This should match the model loaded by text-generation-webui
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+            }
+            response = requests.post(config.llm_api_url, json=payload, timeout=120)
+            response.raise_for_status()
+            json_response = response.json()
+            if 'choices' in json_response and json_response['choices']:
+                llm_response = json_response['choices'][0]['message']['content']
+                self.output.emit(f"[LLM RESPONSE]\n{llm_response}\n")
+            else:
+                self.error.emit(f"[ERROR] Unexpected LLM response format:\n{response.text}")
+        except requests.exceptions.RequestException as e:
+            self.error.emit(f"[ERROR] Could not connect to LLM at {config.llm_api_url}.\nDetails: {str(e)}\n")
 
-    def run(self, prompt: str):
-        if not self.agent_executor:
-            print("Cannot run because the agent failed to initialize.")
+    def run_nmap_command(self, full_command):
+        self.output.emit(f"[INFO] Running command: {full_command}\n")
+        try:
+            command_parts = full_command.split()
+            command_parts[0] = config.nmap_path
+            
+            process = subprocess.Popen(
+                command_parts,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                encoding='utf-8',
+                errors='ignore'
+            )
+            
+            open_ports = []
+            for line in iter(process.stdout.readline, ''):
+                self.output.emit(line)
+                if " open " in line and "Host is up" not in line:
+                    match = re.match(r'(\d+/\w+)\s+open', line)
+                    if match:
+                        open_ports.append(match.group(1))
+            
+            process.stdout.close()
+            process.wait()
+            
+            if open_ports:
+                self.output.emit(f"\n[SUMMARY] Found open ports: {', '.join(open_ports)}\n")
+            self.output.emit("\n[INFO] Nmap scan finished.\n")
+
+        except FileNotFoundError:
+            self.error.emit(f"[ERROR] Nmap not found at '{config.nmap_path}'. Check the path in Settings.\n")
+        except Exception as e:
+            self.error.emit(f"[ERROR] Failed to execute nmap: {str(e)}\n")
+
+    def run_metasploit_command(self, command):
+        """
+        Executes a command using the Metasploit RPC.
+        Example: msf use exploit/multi/handler; set LHOST 0.0.0.0; run
+        """
+        if not self.connect_msf():
             return
-        print(f"\n--- Starting Agent Run with Prompt ---\n'{prompt}'\n---------------------------------------\n")
-        try:
-            response = self.agent_executor.invoke({"input": prompt})
-            print(f"\n--- Agent Run Finished ---\nFinal Answer: {response['output']}")
-        except Exception as e:
-            print(f"An error occurred while running the agent: {e}")
 
-if __name__ == "__main__":
-    agent = EnhancedAIAgent()
-    if agent.agent_executor:
-        print("\nWelcome to the Interactive AI Agent with Networking Tools.")
-        print("WARNING: Use these tools responsibly and only on authorized networks.")
-        print("Enter your prompt below. Type 'exit' or 'quit' to end.")
-        while True:
+        commands_str = command.replace("msf ", "", 1).strip()
+        commands = [cmd.strip() for cmd in commands_str.split(';')]
+
+        for cmd_line in commands:
+            parts = cmd_line.split()
+            if not parts: continue
+            
+            cmd = parts[0].lower()
+            self.output.emit(f"[MSF] > {cmd_line}\n")
+            
             try:
-                user_prompt = input("\nYour Prompt: ")
-                if user_prompt.lower() in ["exit", "quit"]:
-                    print("Exiting agent session. Goodbye!")
-                    break
-                if user_prompt:
-                    agent.run(user_prompt)
-            except KeyboardInterrupt:
-                print("\nExiting agent session. Goodbye!")
-                break
+                if cmd == 'use' and len(parts) > 1:
+                    module_type = 'exploit' # Default
+                    if 'auxiliary' in parts[1]: module_type = 'auxiliary'
+                    if 'post' in parts[1]: module_type = 'post'
+                    
+                    self.current_module = self.msf_client.modules.use(module_type, '/'.join(parts[1:]))
+                    self.output.emit(f"Using module: {self.current_module.name}\n")
+                elif cmd == 'set' and len(parts) > 2:
+                    if hasattr(self, 'current_module'):
+                        self.current_module[parts[1].upper()] = ' '.join(parts[2:])
+                        self.output.emit(f"Set {parts[1].upper()} => {' '.join(parts[2:])}\n")
+                    else:
+                        self.error.emit("[ERROR] No module selected. Use 'use <module>' first.\n")
+                elif cmd == 'run' or cmd == 'exploit':
+                    if hasattr(self, 'current_module'):
+                        cid = self.msf_client.consoles.console().cid
+                        self.msf_client.consoles.console(cid).write(self.current_module.fullname)
+                        # This is a simplified execution, more complex interaction might be needed
+                        console_output = self.msf_client.consoles.console(cid).read()
+                        self.output.emit(console_output['data'])
+                        self.msf_client.consoles.console(cid).destroy()
+                    else:
+                        self.error.emit("[ERROR] No module selected. Use 'use <module>' first.\n")
+                else:
+                    cid = self.msf_client.consoles.console().cid
+                    self.msf_client.consoles.console(cid).write(cmd_line)
+                    console_output = self.msf_client.consoles.console(cid).read()
+                    self.output.emit(console_output['data'])
+                    self.msf_client.consoles.console(cid).destroy()
+            except Exception as e:
+                self.error.emit(f"[MSF ERROR] Failed to execute '{cmd_line}': {e}\n")
+
+
+# --- Main Application Window ---
+class PentestApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Pentest Assistant")
+        self.setGeometry(100, 100, 900, 700)
+        self.initUI()
+        self.initMenu()
+
+    def initMenu(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu('&File')
+
+        settings_action = QAction('&Settings', self)
+        settings_action.triggered.connect(self.show_settings)
+        file_menu.addAction(settings_action)
+
+        exit_action = QAction('&Exit', self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+    def show_settings(self):
+        dialog = SettingsDialog(self)
+        dialog.exec_()
+
+    def initUI(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+
+        self.output_window = QTextEdit()
+        self.output_window.setReadOnly(True)
+        self.output_window.setStyleSheet("""
+            QTextEdit {
+                background-color: #2E3440;
+                color: #D8DEE9;
+                font-family: 'Courier New', monospace;
+                font-size: 14px;
+            }
+        """)
+        self.output_window.setPlaceholderText("Output will appear here. Prefix commands with 'nmap' or 'msf'.\n"
+                                              "Example: nmap -sV -p- example.com\n"
+                                              "Example: msf use auxiliary/scanner/http/title; set RHOSTS example.com; run\n"
+                                              "Anything else will be sent to the LLM.")
+
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Enter command or query...")
+        self.search_bar.setStyleSheet("""
+            QLineEdit {
+                padding: 8px;
+                font-size: 14px;
+                border: 1px solid #4C566A;
+                background-color: #3B4252;
+                color: #ECEFF4;
+            }
+        """)
+        self.search_bar.returnPressed.connect(self.start_task)
+
+        layout.addWidget(self.output_window)
+        layout.addWidget(self.search_bar)
+
+    def start_task(self):
+        command = self.search_bar.text()
+        if not command: return
+
+        self.output_window.append(f"<span style='color: #88C0D0;'>> {command}</span>")
+        self.search_bar.setDisabled(True)
+
+        self.thread = QThread()
+        self.worker = Worker(command)
+        self.worker.moveToThread(self.thread)
+
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.worker.output.connect(self.append_output)
+        self.worker.error.connect(self.append_error)
+        
+        self.thread.finished.connect(lambda: self.search_bar.setDisabled(False))
+        self.thread.finished.connect(lambda: self.search_bar.clear())
+        self.thread.finished.connect(lambda: self.search_bar.setFocus())
+
+        self.thread.start()
+
+    def append_output(self, text):
+        self.output_window.append(text.strip())
+
+    def append_error(self, text):
+        self.output_window.append(f"<span style='color: #BF616A;'>{text.strip()}</span>")
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    main_win = PentestApp()
+    main_win.show()
+    sys.exit(app.exec_())
